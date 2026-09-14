@@ -113,7 +113,7 @@
       "missing_code": 9
     },
     "dashboard/handlers/prompts.py": {
-      "missing_code": 30
+      "missing_code": 28
     },
     "dashboard/handlers/security.py": {
       "missing_code": 16
