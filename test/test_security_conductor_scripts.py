@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -791,6 +793,37 @@ def test_asking_a_scope_question_never_creates_a_ledger(scope_check, db, missing
     assert not db.exists()
 
 
+def test_asking_a_scope_question_does_not_rewrite_the_ledger(
+    ledger, scope_check, db, missing_json, capsys
+):
+    """The docstring's "SELECT only" has to hold for the bytes on disk, not just the SQL.
+
+    ``ledger.connect`` switches the journal to WAL, and that switch rewrites the
+    file header of any database not already in WAL mode -- so a scope QUESTION
+    that borrowed the writer's connection mutated the ledger it promised only to
+    read, and left ``-wal``/``-shm`` sidecars beside it. The ledger here is put
+    back into the default rollback journal first, so the switch would show up as
+    changed bytes; a read-only open cannot make it.
+    """
+    seed_roe(ledger, db)
+    plain = sqlite3.connect(str(db))
+    try:
+        plain.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        plain.close()
+    before = db.read_bytes()
+
+    code = run_scope(
+        scope_check, db, missing_json, "--repo", "kirodotdev/KiroCrew", "--path", "src/x.py"
+    )
+    capsys.readouterr()
+
+    assert code == 0
+    assert db.read_bytes() == before
+    sidecars = sorted(p.name for p in db.parent.iterdir() if p.name.startswith(db.name + "-"))
+    assert sidecars == []
+
+
 # --------------------------------------------------------------------------- #
 # finding_entry
 # --------------------------------------------------------------------------- #
@@ -1312,6 +1345,60 @@ def test_a_proof_that_outlives_the_deadline_is_needs_human(
     assert payload["verdict"] == "needs-human"
     assert "did not finish" in payload["reason"]
     assert verdict_rows(ledger, db, finding_id) == [("verifier", "needs-human")]
+
+
+HELPER_THAT_OUTLIVES_ITS_PARENT = (
+    "import pathlib, time\n"
+    "time.sleep(2)\n"
+    "pathlib.Path('descendant-was-alive.txt').write_text('x', encoding='utf-8')\n"
+)
+
+# A proof that stands up a helper and exits 0 without stopping it: the ordinary
+# sloppy shape (a server to probe, a watcher), not an adversarial one. It records
+# the helper's pid so the test can tell "torn down" from "never started".
+SLOPPY_POC = (
+    "import pathlib, subprocess, sys\n"
+    f"helper = subprocess.Popen([sys.executable, '-c', {HELPER_THAT_OUTLIVES_ITS_PARENT!r}])\n"
+    "pathlib.Path('helper.pid').write_text(str(helper.pid), encoding='utf-8')\n"
+    "raise SystemExit(0)\n"
+)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="process-group teardown is POSIX-only; Windows keeps the direct kill",
+)
+def test_a_proof_that_exits_cleanly_still_takes_its_descendants_down(
+    ledger, verify_finding, db, worktree, capsys
+):
+    """A helper the proof started does not outlive the verdict.
+
+    Killing the direct child alone leaks one live process per unattended cycle
+    whenever a model-authored PoC starts a helper and exits without stopping it.
+    The helper here would write a marker two seconds after its parent exited; a
+    torn-down process group never gets there. POSIX only -- Windows has no
+    process group to signal without a job object, and that residual is stated in
+    ``reap``'s docstring.
+    """
+    (worktree / "poc.py").write_text(SLOPPY_POC, encoding="utf-8")
+    finding_id = a_finding(ledger, db, poc="cmd::python3 poc.py")
+
+    code = verify_finding.main(
+        ["--db", str(db), "--finding-id", str(finding_id), "--worktree", str(worktree)]
+    )
+
+    payload = out_json(capsys)
+    # The helper's own lifetime is 2 s. Every exit path of this test waits it out,
+    # so a red run -- an assertion failing before the drain -- cannot leak the
+    # helper past the test; on the green path the second wait is already over.
+    helper_gone_by = time.monotonic() + 3.0
+    try:
+        assert (code, payload["verdict"]) == (10, "rejected")
+        assert (worktree / "helper.pid").exists(), "the proof never started its helper"
+        time.sleep(max(0.0, helper_gone_by - time.monotonic()))
+        assert not (worktree / "descendant-was-alive.txt").exists()
+    finally:
+        time.sleep(max(0.0, helper_gone_by - time.monotonic()))
 
 
 def test_an_unknown_finding_records_nothing(ledger, verify_finding, db, worktree, capsys):
@@ -1842,6 +1929,94 @@ def test_the_requested_test_failing_still_confirms(verify_finding, tmp_path):
     verdict, _ = verify_finding.judge_report(report, "test_poc.py::test_the_real_one")
 
     assert verdict == "confirmed"
+
+
+def test_a_parametrised_proof_cited_by_its_base_name_is_judged_on_its_own_cases(
+    verify_finding, tmp_path
+):
+    """``pytest::file::test_foo`` selects every ``test_foo[...]``; so must the report match.
+
+    pytest names a parametrised case ``test_foo[a]`` in the JUnit report, so an
+    exact comparison against the bare ``test_foo`` matched nothing, and a finding
+    whose proof is a parametrised test -- accepted at filing, since the nodeid
+    names a test -- landed on ``needs-human`` on every run, unconfirmable and
+    silent about it.
+    """
+    report = tmp_path / "result.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="2">'
+        '<testcase classname="test_poc" name="test_the_real_one[a]">'
+        "<failure>boom</failure></testcase>"
+        '<testcase classname="test_poc" name="test_the_real_one[b]">'
+        "<failure>boom</failure></testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    verdict, reason = verify_finding.judge_report(report, "test_poc.py::test_the_real_one")
+
+    assert verdict == "confirmed"
+    assert "2 of 2" in reason
+
+
+def test_one_failing_case_of_a_parametrised_proof_confirms(verify_finding, tmp_path):
+    """The aggregation rule: a proof's cases are its runs, and ONE failing run reproduces.
+
+    A finding claims "the defect is present"; a parametrised proof that fails for
+    one input and passes for another has demonstrated it for that input, which is
+    the same reading a single unparametrised failure gets. The reason says how
+    many of the runs failed, so the human reading the ledger sees the split.
+    """
+    report = tmp_path / "result.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="2">'
+        '<testcase classname="test_poc" name="test_the_real_one[a]"/>'
+        '<testcase classname="test_poc" name="test_the_real_one[b]">'
+        "<failure>boom</failure></testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    verdict, reason = verify_finding.judge_report(report, "test_poc.py::test_the_real_one")
+
+    assert verdict == "confirmed"
+    assert "1 of 2" in reason
+
+
+def test_a_parametrised_sibling_is_still_not_the_requested_test(verify_finding, tmp_path):
+    """Widening to a test's OWN cases must not reach a test whose name merely extends it.
+
+    ``test_the_real_one_too[a]`` shares the prefix but is a different test; only
+    the ``[`` that pytest puts between a test's name and its case id counts. And a
+    nodeid that names ONE case, ``test_the_real_one[a]``, is judged on that case
+    alone, not on its parametrised siblings.
+    """
+    report = tmp_path / "result.xml"
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="4">'
+        '<testcase classname="test_poc" name="test_the_real_one[a]"/>'
+        '<testcase classname="test_poc" name="test_the_real_one[b]">'
+        "<failure>boom</failure></testcase>"
+        '<testcase classname="test_poc" name="test_the_real_one_too[a]">'
+        "<failure>boom</failure></testcase>"
+        '<testcase classname="test_poc" name="test_the_real_one_too">'
+        "<failure>boom</failure></testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+
+    one_case, one_reason = verify_finding.judge_report(report, "test_poc.py::test_the_real_one[a]")
+    report.write_text(
+        '<testsuites><testsuite name="pytest" tests="3">'
+        '<testcase classname="test_poc" name="test_the_real_one[a]"/>'
+        '<testcase classname="test_poc" name="test_the_real_one_too[a]">'
+        "<failure>boom</failure></testcase>"
+        '<testcase classname="test_poc" name="test_the_real_one_too">'
+        "<failure>boom</failure></testcase></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    base_name, base_reason = verify_finding.judge_report(report, "test_poc.py::test_the_real_one")
+
+    assert (one_case, base_name) == ("rejected", "rejected")
+    assert "1 run(s)" in one_reason
+    assert "1 run(s)" in base_reason
 
 
 def test_the_verifier_refuses_the_checkout_it_is_running_from(verify_finding, tmp_path):

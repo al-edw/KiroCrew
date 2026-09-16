@@ -72,10 +72,12 @@ This screen is a NAMED-SHAPE CHECK on the AUDITOR'S text, not a sandbox. The
 RFC's trust boundary is explicit: the auditor's finding is model-authored and
 untrusted, so its PoC is screened before it runs; the target checkout is the
 operator's own and is trusted. Containment is the disposable worktree plus the
-deadline. This script does not attempt to defend the operator from code they
-chose to check out and run as themselves -- there is no privilege drop to
-defend, and Kiro Crew's namespace sandbox is Linux-only, which a cross-platform
-verifier cannot take on.
+deadline, plus -- on POSIX -- tearing down the proof's process group after every
+outcome, so a helper a sloppy PoC started does not outlive the verdict (Windows
+keeps the direct kill; ``reap`` states that residual). This script does not
+attempt to defend the operator from code they chose to check out and run as
+themselves -- there is no privilege drop to defend, and Kiro Crew's namespace
+sandbox is Linux-only, which a cross-platform verifier cannot take on.
 
 What the child process gets: the PoC's argv, ``cwd`` set to the worktree, a
 minimal environment, and a deadline. ``HOME`` points AT the worktree, so a
@@ -96,6 +98,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -472,6 +475,23 @@ def case_name(chunk: str) -> str | None:
     return None if match is None else match.group(1)
 
 
+def is_requested_case(name: str | None, wanted: str) -> bool:
+    """Is this reported testcase one the nodeid selected?
+
+    The name itself, or one of ITS parametrisations: pytest reports a
+    parametrised case as ``test_foo[a]``, so a nodeid that stops at ``test_foo``
+    -- which pytest runs as every case of that test -- has to accept those, or a
+    finding whose proof is a parametrised test lands on ``needs-human`` on every
+    run while the filing accepted it. Only the ``[`` pytest puts between a test's
+    name and its case id counts, so a parametrised SIBLING (``test_foo_too[a]``)
+    stays excluded, and a nodeid that names one case (``test_foo[a]``) is judged
+    on that case alone.
+    """
+    if name is None:
+        return False
+    return name == wanted or name.startswith(wanted + "[")
+
+
 def judge_report(report_path: Path, nodeid: str) -> tuple[str, str]:
     """Map pytest's JUnit report onto a verdict. Fails closed to ``needs-human``.
 
@@ -510,7 +530,7 @@ def judge_report(report_path: Path, nodeid: str) -> tuple[str, str]:
     # the selector's file collected -- and folding those in let an UNRELATED failure
     # confirm this finding. Naming the test was never enough on its own: the verdict
     # has to be read off that test's own result.
-    requested = [chunk for chunk in cases if case_name(chunk) == wanted]
+    requested = [chunk for chunk in cases if is_requested_case(case_name(chunk), wanted)]
     if not requested:
         return (
             NEEDS_HUMAN,
@@ -608,17 +628,55 @@ class LaunchFailed:
         self.message = message
 
 
-def reap(process: subprocess.Popen[bytes]) -> None:
-    """Kill the proof if it is still running, then wait for it. Safe to call twice.
+def spawn_options() -> dict[str, Any]:
+    """``Popen`` keywords that make the proof its own process-group leader.
 
-    The direct child only. A proof that detaches a grandchild is the operator's
-    own checkout leaving a process on the operator's own machine, which the RFC's
-    trust boundary places outside this script: there is no privilege drop to
-    defend, and a portable process-tree kill does not exist in the standard
-    library. The verdict is already decided when this runs, so a bounded wait
-    beats blocking the conductor on an unreapable child.
+    POSIX only. ``start_new_session`` puts the child at the head of a fresh
+    session, so its pid is also its process-group id and every helper it starts
+    without leaving the group can be reached through that one number. Windows has
+    no equivalent short of a job object, which needs a third-party package these
+    stdlib scripts do not take, so it gets no option and keeps the direct kill.
+    """
+    if sys.platform == "win32":
+        return {}
+    return {"start_new_session": True}
+
+
+def reap(process: subprocess.Popen[bytes]) -> None:
+    """Take down whatever the proof left running, then wait. Safe to call twice.
+
+    Runs after EVERY outcome, not only a timeout: the ordinary sloppy proof is one
+    that stands up a helper -- a server to probe, a watcher -- and exits 0 without
+    stopping it. Killing the direct child alone leaked one live process per
+    unattended cycle, and a PoC is model-authored, so "sloppy" is the expected
+    input rather than the exceptional one.
+
+    On POSIX the proof's whole process group goes. The group is addressed by the
+    child's own pid, which IS the group id because the child was spawned as a
+    session leader -- not through ``os.getpgid``, which would raise on the
+    clean-exit path, where the leader is already reaped and its survivors are
+    exactly what there is to reach. ``ProcessLookupError`` means the group is
+    already empty, which is the goal; any other ``OSError`` (a helper that
+    changed its uid, say) is swallowed too, because the verdict is decided by
+    the time this runs and teardown is best effort. A reaped leader's pid could
+    in principle be handed to a new process before this signal lands, but the
+    signal only reaches a process whose GROUP id is that number -- one that made
+    itself a leader in the same instant -- which is the accepted residual.
+
+    Two residuals, stated rather than hidden. **Windows keeps the direct kill**:
+    a helper a proof leaves running there outlives the verdict. And on POSIX a
+    descendant that calls ``setsid`` itself has LEFT the group and is out of
+    reach; containing a process that is actively escaping needs a kernel-level
+    container, which is the RFC's open OS-sandbox decision, not this script's.
+    The bounded wait is because blocking the conductor on an unreapable child
+    would be worse than the bounded leak.
     """
     process.kill()
+    if sys.platform != "win32":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
     try:
         process.wait(timeout=REAP_SECONDS)
     except subprocess.TimeoutExpired:
@@ -645,6 +703,7 @@ def run_poc(argv: list[str], worktree: Path, timeout: int) -> int | Timeout | La
             # No shell, no inherited stdin: a PoC that waits on input must hit
             # the deadline rather than hang on a terminal nobody is watching.
             stdin=subprocess.DEVNULL,
+            **spawn_options(),
         )
     except OSError as exc:
         # A mistyped or hallucinated program name is the verifier's ordinary
@@ -658,6 +717,9 @@ def run_poc(argv: list[str], worktree: Path, timeout: int) -> int | Timeout | La
     except subprocess.TimeoutExpired:
         reap(process)
         return Timeout()
+    # The status is in hand before the teardown, so cleanup cannot change the
+    # verdict; it only takes down what the proof left behind (see ``reap``).
+    reap(process)
     return returncode
 
 
