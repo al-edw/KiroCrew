@@ -764,6 +764,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
           cron: true,
           network: true,
           memory: 'read',
+          sessionApproval: true,
         },
         mcpServers: {
           ledgerd: {
@@ -795,6 +796,13 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(screen.getByText('Cron: yes')).toBeInTheDocument()
     expect(screen.getByText('Network: yes')).toBeInTheDocument()
     expect(screen.getByText(/Memory:/)).toBeInTheDocument()
+    expect(screen.getByText(/Can approve or deny tool prompts in your sessions/)).toBeInTheDocument()
+    expect(screen.getByText('Modes it can set:')).toBeInTheDocument()
+    expect(screen.getByText('sessionApproval')).toBeInTheDocument()
+    expect(screen.getByText('Normal')).toBeInTheDocument()
+    expect(screen.getByText('Reads')).toBeInTheDocument()
+    expect(screen.getByText('Trust')).toBeInTheDocument()
+    expect(screen.getByText('YOLO')).toBeInTheDocument()
 
     expect(screen.getByText('MCP Servers')).toBeInTheDocument()
     expect(screen.getByText('ledgerd')).toBeInTheDocument()

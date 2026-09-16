@@ -45,6 +45,19 @@ are **deny-by-default** confined by the dashboard auth middleware
 independently re-checks that the caller's token app matches the target app, since
 the proxy signs requests with the target app's secret.
 
+Approval routes add a second, semantic check. An enabled app must declare
+`permissions.sessionApproval: true` before its app token can approve or deny a
+pending tool request, or change a user session's approval mode. The app still
+needs the matching route in `permissions.api`. Non-YOLO mode changes must name a
+live slot, which prevents one app call from silently widening every user session.
+The global YOLO mode remains subject to the host's approval-mode policy.
+
+The guard reads the live manifest so that removing the flag revokes the grant at
+once. Live-read is not a grant path: `update_app` compares the old and new
+manifests, and a version that newly declares `sessionApproval` on an enabled app
+comes back disabled. The user sees the grant on the app page and re-enables the
+app to consent; repo trust never covers a permission the user has not seen.
+
 ### WebSocket event scope (CWE-269)
 
 `/api/ws` is a *third* surface reachable with the same app token, and it is scoped

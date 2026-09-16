@@ -1917,6 +1917,66 @@ class TestCopyAppTree:
         assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
         assert secret.read_text(encoding="utf-8") == "s3cret"
 
+    def test_update_that_adds_session_approval_disables_until_reconsent(
+        self, tmp_path, app_home
+    ):
+        # Consent is captured at install/enable while the route guard reads the
+        # live manifest, so a version that ADDS the grant must not inherit the
+        # user's earlier "enabled" -- otherwise an update silently widens what
+        # the app may do to their sessions.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert enable_app("test-app").ok
+        assert get_app("test-app")["enabled"] is True
+
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert "session approval" in result.message
+        assert get_app("test-app")["enabled"] is False
+        assert get_app("test-app")["version"] == "2.0.0"
+
+    def test_update_keeping_session_approval_stays_enabled(self, tmp_path, app_home):
+        # The grant was already declared when the user enabled the app, so a
+        # refresh that keeps it is not a new request.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(
+            _make_app_source(tmp_path, permissions={"sessionApproval": True})
+        ).ok
+        assert enable_app("test-app").ok
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert get_app("test-app")["enabled"] is True
+
+    def test_update_of_disabled_app_adding_session_approval_stays_disabled(
+        self, tmp_path, app_home
+    ):
+        # Nothing to revoke: a disabled app was never granted anything live.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert get_app("test-app")["enabled"] is False
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert get_app("test-app")["enabled"] is False
+        assert "session approval" not in result.message
+
     def test_local_update_clears_prior_registry_provenance(self, tmp_path, app_home):
         from kiro_crew.apps.manager import (
             _read_installed,

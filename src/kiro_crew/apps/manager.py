@@ -897,6 +897,17 @@ def update_app(
         )
 
     old_version = existing.version
+    # Consent to session-approval control is captured at install/enable, but the
+    # route guard reads the LIVE manifest. Without this check a routine update
+    # that adds ``permissions.sessionApproval`` would gain control of the user's
+    # sessions with no consent moment. Read the old manifest BEFORE the tree is
+    # replaced; the comparison happens after the copy succeeds.
+    old_manifest = get_app_manifest(name)
+    widened_session_approval = bool(
+        existing.enabled
+        and manifest.permissions.sessionApproval
+        and not (old_manifest and old_manifest.permissions.sessionApproval)
+    )
 
     # Preserve data directory and app secret
     data_dir = dest / "data"
@@ -957,6 +968,10 @@ def update_app(
         version=manifest.version,
         displayName=manifest.displayName,
         updatedAt=_now_iso(),
+        # A widened session-approval grant is a NEW request, not a refresh of the
+        # one the user accepted: the app comes back disabled and the detail page
+        # shows the grant before the user re-enables it.
+        enabled=False if widened_session_approval else existing.enabled,
         source=str(source),
         # A local-source update is a provenance transition, not a refresh of the
         # old registry checkout. Keeping the previous sourceUrl made runtime
@@ -980,6 +995,23 @@ def update_app(
         manifest.version,
         source,
     )
+    if widened_session_approval:
+        sel().log_api_access(
+            caller="app_update",
+            operation="session_approval_widened",
+            outcome="disabled",
+            resources=f"name={name!r}",
+            error="update added permissions.sessionApproval; re-enable to consent",
+        )
+        return AppResult(
+            ok=True,
+            name=name,
+            message=(
+                f"updated {name} v{old_version} -> v{manifest.version}; "
+                "disabled because this version newly requests session approval "
+                "control -- review it on the app page and enable again"
+            ),
+        )
     return AppResult(
         ok=True,
         name=name,

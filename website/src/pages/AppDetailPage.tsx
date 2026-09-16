@@ -12,7 +12,7 @@ import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
   Trash2, RefreshCw, Bot, Zap, ArrowUp,
   Clock, ChevronLeft, ChevronRight, X, Monitor, Copy, Terminal,
-  Target, Settings2, Star,
+  Target, Settings2, Star, ShieldAlert,
 } from 'lucide-react'
 import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
@@ -115,6 +115,7 @@ interface AppPermissions {
   cron?: boolean
   network?: boolean
   memory?: boolean | string
+  sessionApproval?: boolean
   [key: string]: unknown
 }
 
@@ -1041,6 +1042,7 @@ export default function AppDetailPage() {
         displayName: app.displayName,
         trustRepository: app.trustRepository,
         origin: app.origin,
+        sessionApproval: app.manifest?.permissions?.sessionApproval === true,
       },
       async () => {
         // ANY unsuccessful retry must REJECT, not resolve. `useTrustGate` rolls the
@@ -1098,6 +1100,7 @@ export default function AppDetailPage() {
           displayName: app.displayName,
           trustRepository: app.trustRepository,
           origin: app.origin,
+          sessionApproval: app.manifest?.permissions?.sessionApproval === true,
         })
       } else {
         setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to', { action }))
@@ -1615,6 +1618,29 @@ export default function AppDetailPage() {
                         <code key={t} className="bg-ok-subtle border border-ok/20 px-1.5 py-0.5 rounded text-[11px] text-ok">{t}</code>
                       ))}
                     </div>
+                  </div>
+                )}
+                {app.manifest.permissions.sessionApproval && (
+                  <div className="rounded-md border border-warn/30 bg-warn-subtle px-2.5 py-2">
+                    {/* Plain words first: the manifest key alone told a reader nothing
+                        about what the app can do to their sessions. The key stays as
+                        the secondary label so it matches the manifest they may read. */}
+                    <div className="flex items-start gap-2 text-text">
+                      <ShieldAlert size={13} className="mt-[2px] shrink-0 text-warn" />
+                      <span>{i18nT('pages.appDetailPage.session_approval_desc')}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1 mt-1.5 text-muted" role="list">
+                      <span>{i18nT('pages.appDetailPage.session_approval_modes')}</span>
+                      {[
+                        'components.approvalModePicker.normal_label',
+                        'components.approvalModePicker.reads_label',
+                        'components.approvalModePicker.trust_label',
+                        'components.approvalModePicker.yolo_label',
+                      ].map(key => (
+                        <Badge key={key} variant="muted" role="listitem">{i18nT(key)}</Badge>
+                      ))}
+                    </div>
+                    <code className="mt-1.5 block text-[11px] text-muted">sessionApproval</code>
                   </div>
                 )}
                 <div className="flex flex-wrap gap-3 text-[12px] text-muted mt-1">

@@ -999,6 +999,15 @@ stale entry serves the previous value while refreshing.
 because iterating a string yields its characters (`"*"` → the wildcard, and
 `"/api/chat"` → the prefix `"/"`, which matches every path).
 
+**User-session approval control is explicit.** App-token calls that approve or
+deny tool requests, or change approval modes, require an enabled app whose live
+manifest declares `permissions.sessionApproval: true`. The route must also be
+allowed by `permissions.api`. All per-session mode changes require an explicit
+live slot; only YOLO is global, and governance can still deny it. Consent is
+captured when the user enables the app, so `update_app` disables an enabled app
+whose new version adds the flag (SEL operation `session_approval_widened`); the
+user re-enables it after seeing the grant on the detail page.
+
 **Filtering the frame is not always enough.** Two event shapes carry other
 tenants' data inside a payload the gate admits wholesale, so they are narrowed on
 the send path in `_serialize_for_client`: the `slots` re-push (a full slot list)

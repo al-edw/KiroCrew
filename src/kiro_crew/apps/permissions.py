@@ -58,6 +58,12 @@ def validate_permissions(manifest: AppManifest) -> PermissionCheck:
             "App requests shared memory access — it can read/write KiroCrew's memory stores"
         )
 
+    if perms.sessionApproval:
+        result.warnings.append(
+            "App requests session approval access — it can approve, deny, "
+            "or change approval modes for user sessions"
+        )
+
     # Path traversal in any resource paths
     for path_list_name in ("agents", "skills", "sops"):
         for p in getattr(manifest, path_list_name, []):
@@ -79,6 +85,30 @@ def check_tool_permission(app_name: str, tool_name: str, manifest: AppManifest) 
     return tool_name in manifest.permissions.mcpTools
 
 
+def app_can_manage_session_approvals(app_name: str) -> bool:
+    """Return whether an enabled app currently holds the session approval grant.
+
+    Read the live manifest on every decision. App tokens can outlive an enable
+    cycle, so a cached grant must not survive a disable or manifest edit.
+    """
+    if not app_name:
+        return False
+    try:
+        from kiro_crew.apps.manager import get_app_manifest, is_app_enabled
+
+        if not is_app_enabled(app_name):
+            return False
+        manifest = get_app_manifest(app_name)
+        return bool(manifest and manifest.permissions.sessionApproval)
+    except Exception:
+        logger.warning(
+            "Could not resolve session approval permission for app %s",
+            app_name,
+            exc_info=True,
+        )
+        return False
+
+
 def format_permissions_summary(manifest: AppManifest) -> str:
     """Format a human-readable permissions summary for display during install."""
     perms = manifest.permissions
@@ -96,6 +126,8 @@ def format_permissions_summary(manifest: AppManifest) -> str:
         lines.append(f"  Memory:    {perms.memory}")
     if perms.cron:
         lines.append("  Cron:      scheduled agent jobs")
+    if perms.sessionApproval:
+        lines.append("  Sessions:  approve requests and change approval modes")
 
     if not lines:
         return "  No special permissions required"

@@ -5658,6 +5658,8 @@
       "once_launched_the_app_will_automatically_connect": "Once launched, the app will automatically connect to this {{productName}} instance and appear in Apps.",
       "origin": "Origin:",
       "permissions": "Permissions",
+      "session_approval_desc": "Can approve or deny tool prompts in your sessions and switch a session's approval mode.",
+      "session_approval_modes": "Modes it can set:",
       "platform": "Platform:",
       "previous": "Previous",
       "removes_kirocrew_metadata_only_the_app_itself_is": "Removes {{productName}} metadata only — the app itself is managed externally",
