@@ -6406,6 +6406,7 @@ class DashboardState:
             is_background=is_background,
             redact_url=redact_exfiltration_urls,
             redact_secret=redact_credentials,
+            permission_marker=_permission_marker(),
         )
 
     def _audit_and_broadcast_approval(

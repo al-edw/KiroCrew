@@ -33,6 +33,7 @@ class ApprovalCoordinator:
         is_background: bool,
         redact_url: _Redactor,
         redact_secret: _Redactor,
+        permission_marker: Callable[[list[dict], str, str], bool],
     ) -> bool:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[bool] = loop.create_future()
@@ -55,8 +56,69 @@ class ApprovalCoordinator:
         except (asyncio.TimeoutError, asyncio.CancelledError):
             return False
         finally:
+            # A future that never carried a decision means the wait expired or
+            # was cancelled: retire the approval BEFORE popping it, exactly as
+            # resolve() retires a decided one, or the rendered card keeps live
+            # buttons that answer 404 forever and a history reload resurrects
+            # it. A resolved future (done with a result) was already retired by
+            # resolve()/resolve_state() — retiring again here would double the
+            # broadcast on the healthy path.
+            if future.cancelled() or not future.done():
+                ApprovalCoordinator._retire_unresolved(state, approval_id, slot, permission_marker)
             state._pending_approvals.pop(approval_id, None)
             state._approval_futures.pop(approval_id, None)
+
+    @staticmethod
+    def _retire_unresolved(
+        state: Any,
+        approval_id: str,
+        slot_key: str,
+        permission_marker: Callable[[list[dict], str, str], bool],
+    ) -> None:
+        """Retire an approval whose wait ended without a decision.
+
+        Mirrors the retire ``resolve()`` performs for decided approvals: mark
+        the rendered ``permission`` message resolved, then broadcast
+        ``approval_resolved``. The explicit ``"expired"`` decision keeps the
+        SEL trail from attributing a timeout to a user rejection. Every step
+        is individually failure-tolerant in the same spirit as
+        ``audit_and_broadcast``: a retire that raises must not prevent the
+        caller's pops, or the expiry path would leak pending entries.
+        """
+        decision = "expired"
+        slot_obj = state._slots.get(slot_key) if slot_key else None
+        if slot_obj is not None:
+            try:
+                if permission_marker(slot_obj.messages, approval_id, decision):
+                    # The periodic flush skips clean slots; the resolved marker
+                    # must become durable before its future disappears.
+                    slot_obj._dirty = True
+            except Exception:
+                state._log.warning(
+                    "permission marker failed for expired approval %s",
+                    approval_id,
+                    exc_info=True,
+                )
+            try:
+                state._audit_and_broadcast_approval(slot_obj.key, approval_id, False, decision)
+            except Exception:
+                state._log.warning(
+                    "audit/broadcast failed for expired approval %s", approval_id, exc_info=True
+                )
+            try:
+                state.push_slots_update()
+            except Exception:
+                state._log.warning(
+                    "slot push failed for expired approval %s", approval_id, exc_info=True
+                )
+        else:
+            # State-level background approval: no slot messages to mark.
+            try:
+                state._audit_and_broadcast_approval("state", approval_id, False, decision)
+            except Exception:
+                state._log.warning(
+                    "audit/broadcast failed for expired approval %s", approval_id, exc_info=True
+                )
 
     @staticmethod
     def audit_and_broadcast(
