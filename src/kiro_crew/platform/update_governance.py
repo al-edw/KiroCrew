@@ -24,7 +24,8 @@ import re
 import subprocess
 
 from kiro_crew import platform_compat
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
+from kiro_crew.subprocess_utf8 import utf8_stdout
 
 logger = logging.getLogger(__name__)
 
@@ -114,17 +115,21 @@ def _git_probe(proj: str, *args: str) -> str | None:
         # `"git"`, which is the hazard itself.
         return None
     try:
+        # Bytes mode, decoded by utf8_stdout: text mode's universal-newline
+        # translation rewrites every ``\r`` in git's stdout, and the RAW-stdout
+        # contract at the `--worktree` classification site below requires a
+        # ``\r`` inside a ``rev-parse --absolute-git-dir`` answer to survive as
+        # path content (see kiro_crew.git_worktree_scope).
         done = subprocess.run(
             [git, *args],
             cwd=proj,
             capture_output=True,
             timeout=_GIT_TIMEOUT_SECS,
             env=git_command_env(),
-            **UTF8_TEXT,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    return done.stdout if done.returncode == 0 else None
+    return utf8_stdout(done.stdout) if done.returncode == 0 else None
 
 
 def resolve_remote_url(proj: str, *, remote: str = "", branch: str = "") -> str:
@@ -475,18 +480,41 @@ def repo_exec_config_reason(proj: str) -> str:
     machine configuration, not something the repository supplies.
     """
     scopes = ["--local"]
-    if _git(
-        proj, "config", "--local", "--includes", "--get", "extensions.worktreeConfig"
-    ).lower() in (
-        "true",
-        "yes",
-        "on",
-        "1",
+    # --bool folds every git-true spelling (yes/on/1/valueless) to "true"; a
+    # raw-spelling allowlist misses the valueless boolean form, which git
+    # still honors for config.worktree. A garbled value makes --bool exit
+    # non-zero (reads as "") AND kills the guarded git command itself with
+    # the same parse error, so skipping the scope is safe.
+    if (
+        _git(
+            proj,
+            "config",
+            "--local",
+            "--includes",
+            "--bool",
+            "--get",
+            "extensions.worktreeConfig",
+        )
+        == "true"
     ):
         scopes.append("--worktree")
     for scope in scopes:
         listing = _git_probe(proj, "config", scope, "--includes", "--name-only", "--list")
         if listing is None:
+            # Probe-first, classify after: git creates config.worktree lazily,
+            # so a --worktree listing that failed on a genuinely ABSENT file is
+            # the empty scope git documents, not an unreadable one (the shared
+            # decision in kiro_crew.git_worktree_scope). Every other failure
+            # stays _EXEC_CONFIG_UNREADABLE, including an unlocatable git dir.
+            # RAW stdout (_git_probe, not _git): the classifier trims exactly
+            # git's newline, and a stripped whitespace-bearing path would
+            # lstat the wrong location.
+            if scope == "--worktree":
+                gitdir_raw = _git_probe(proj, "rev-parse", "--absolute-git-dir")
+                if worktree_probe_failure_is_empty_scope(
+                    gitdir_raw if gitdir_raw is not None else "", proj
+                ):
+                    continue
             return _EXEC_CONFIG_UNREADABLE
         for line in listing.splitlines():
             key = line.strip()

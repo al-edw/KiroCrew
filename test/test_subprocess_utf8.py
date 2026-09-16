@@ -65,3 +65,56 @@ class TestUtf8TextMapping:
         ]
         result = subprocess.run(argv, capture_output=True, **UTF8_TEXT)
         assert result.stdout == "ok \ufffd\ufffd end\n"
+
+
+class TestUtf8Stdout:
+    """``utf8_stdout`` is the bytes-mode counterpart of ``UTF8_TEXT``: same
+    UTF-8-with-replacement policy, WITHOUT the universal-newline translation
+    text mode hard-enables. A ``\\r`` in a child's output is content there
+    (git prints paths byte-for-byte), so the decode must preserve it."""
+
+    def test_carriage_return_survives_the_decode(self):
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        assert utf8_stdout(b"wt\rcr/.git\n") == "wt\rcr/.git\n"
+
+    def test_crlf_is_not_collapsed(self):
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        assert utf8_stdout(b"path\r\n") == "path\r\n"
+
+    def test_str_passes_through_for_test_stand_ins(self):
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        assert utf8_stdout("already decoded\r\n") == "already decoded\r\n"
+
+    def test_none_is_the_empty_answer(self):
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        assert utf8_stdout(None) == ""
+
+    def test_malformed_bytes_degrade_to_replacement(self):
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        assert utf8_stdout(b"a\xffb") == "a\ufffdb"
+
+    def test_real_child_output_keeps_its_cr(self):
+        """End-to-end: a bytes-mode capture decoded by utf8_stdout hands the
+        caller the child's ``\\r`` intact, where ``UTF8_TEXT`` (text mode)
+        would have rewritten it to ``\\n``. The child writes through
+        ``sys.stdout.buffer`` so its OWN text-mode stdout cannot translate
+        the ``\\n`` to ``\\r\\n`` on Windows before the capture ever sees it --
+        this test pins the parent-side decode, not the child's platform."""
+        from kiro_crew.subprocess_utf8 import utf8_stdout
+
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'a\\rb\\n')",
+            ],
+            capture_output=True,
+            env=_CHILD_UTF8_ENV,
+        )
+        assert done.returncode == 0
+        assert utf8_stdout(done.stdout) == "a\rb\n"
